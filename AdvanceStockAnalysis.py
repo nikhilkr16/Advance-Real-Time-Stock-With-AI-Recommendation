@@ -127,7 +127,7 @@ def safe_execute(func):
 @safe_execute
 def get_symbol_suggestions(query):
     """Fetch stock symbol suggestions using Finnhub API."""
-    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "YOUR_FINNHUB_API_KEY_HERE":
+    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "d1sdgppr01qs2slhjh20d1sdgppr01qs2slhjh2g":
         st.warning("Please provide a valid Finnhub API key in the code to enable stock symbol suggestions.")
         return []
     url = f"https://finnhub.io/api/v1/search?q={query}&token={FINNHUB_API_KEY}"
@@ -149,7 +149,7 @@ def _get_realtime_price_finnhub(symbol):
     This function is kept for potential future use or if the user decides to switch back,
     but its output is not used for current price metrics in get_google_finance_data as per request.
     """
-    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "YOUR_FINNHUB_API_KEY_HERE":
+    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "d1sdgppr01qs2slhjh20d1sdgppr01qs2slhjh2g":
         st.warning("Finnhub API key is not set. Real-time price may not be accurate.")
         return None, None
     
@@ -438,8 +438,8 @@ def hold_stock(symbol): st.session_state.transaction_log.append({'action': 'hold
 # --- Main Dashboard Logic (Equity) ---
 def equity_dashboard():
     st.sidebar.markdown("---")
-    data_source = st.sidebar.selectbox("📈 Select Data Source", ["Google Finance (Real-time)", "NSE Library (Comprehensive)", "Demo Mode"])
-    symbol_input = st.sidebar.text_input("Stock Symbol or Name", "ASHOKLEY")
+    data_source = st.sidebar.selectbox("📈 Select Data Source", ["Google Finance (Real-time)", "NSE Library (Comprehensive)", "Demo Mode"], index=0) # Set default to Google Finance
+    symbol_input = st.sidebar.text_input("Stock Symbol or Name", "TCS")
     suggestions = get_symbol_suggestions(symbol_input)
     if suggestions:
         st.sidebar.info("Suggestions:")
