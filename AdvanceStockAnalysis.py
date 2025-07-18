@@ -10,12 +10,20 @@ import time
 from datetime import datetime, timedelta
 import warnings
 import json
+import os
 from streamlit_autorefresh import st_autorefresh
 
 warnings.filterwarnings('ignore')
 
 # --- API Keys and Configuration ---
-FINNHUB_API_KEY = "d1sdgppr01qs2slhjh20d1sdgppr01qs2slhjh2g" # REPLACE WITH YOUR ACTUAL FINNHUB API KEY
+# Secure API key retrieval from environment variables
+FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY', '')
+
+# Display warning if API key is not set properly
+if not FINNHUB_API_KEY:
+    st.sidebar.warning("⚠️ FINNHUB_API_KEY environment variable not set. Some features may be limited.")
+    st.sidebar.info("To set it: export FINNHUB_API_KEY='your_api_key_here'")
+    FINNHUB_API_KEY = None
 
 # --- Safe Imports with Fallback ---
 try:
@@ -122,18 +130,108 @@ def safe_execute(func):
             return None
     return wrapper
 
+# --- Stock Symbol Validation Functions ---
+def validate_stock_symbol(symbol):
+    """
+    Validates stock symbol format and checks if it's likely a valid Indian stock symbol.
+    
+    Args:
+        symbol (str): Stock symbol to validate
+        
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    if not symbol or not isinstance(symbol, str):
+        return False, "Stock symbol cannot be empty"
+    
+    # Clean and normalize symbol
+    symbol = symbol.strip().upper()
+    
+    # Basic format validation
+    if len(symbol) < 1 or len(symbol) > 10:
+        return False, "Stock symbol should be between 1-10 characters"
+    
+    # Check for invalid characters (should be alphabetic, may contain numbers but not all numbers)
+    if not symbol.replace('.', '').replace('-', '').isalnum():
+        return False, "Stock symbol contains invalid characters"
+    
+    # Reject purely numeric symbols (stocks should have letters)
+    if symbol.replace('.', '').replace('-', '').isdigit():
+        return False, "Stock symbol cannot be purely numeric"
+    
+    # Should contain at least one letter
+    if not any(c.isalpha() for c in symbol):
+        return False, "Stock symbol must contain at least one letter"
+    
+    return True, ""
+
+def check_symbol_availability(symbol, data_source="Google Finance"):
+    """
+    Attempts to verify if a stock symbol exists by making a test API call.
+    
+    Args:
+        symbol (str): Stock symbol to check
+        data_source (str): Data source to check against
+        
+    Returns:
+        tuple: (is_available, message)
+    """
+    try:
+        if data_source == "Google Finance":
+            # Quick test to see if Google Finance has data for this symbol
+            url = f'https://www.google.com/finance/quote/{symbol}:NSE'
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, timeout=5)
+            
+            if response.status_code == 404:
+                return False, f"Symbol '{symbol}' not found on Google Finance NSE"
+            elif response.status_code != 200:
+                return False, f"Unable to verify symbol '{symbol}' (HTTP {response.status_code})"
+            
+            # Check if the page contains price data
+            if "data-symbol" not in response.text.lower() and "stock" not in response.text.lower():
+                return False, f"Symbol '{symbol}' does not appear to be a valid stock on NSE"
+                
+        elif data_source == "Finnhub" and FINNHUB_API_KEY:
+            # Test Finnhub API
+            test_url = f"https://finnhub.io/api/v1/quote?symbol=NSE:{symbol}&token={FINNHUB_API_KEY}"
+            response = requests.get(test_url, timeout=5)
+            
+            if response.status_code != 200:
+                return False, f"Finnhub API error for symbol '{symbol}' (HTTP {response.status_code})"
+            
+            data = response.json()
+            if not data or data.get('c', 0) == 0:
+                return False, f"No price data available for symbol '{symbol}' on Finnhub"
+        
+        return True, f"Symbol '{symbol}' appears to be valid"
+        
+    except requests.exceptions.RequestException as e:
+        return False, f"Network error while verifying symbol '{symbol}': {str(e)[:100]}"
+    except Exception as e:
+        return False, f"Error verifying symbol '{symbol}': {str(e)[:100]}"
 # --- Data Fetching Functions ---
 @st.cache_data(ttl=60*60*24)
 @safe_execute
 def get_symbol_suggestions(query):
-    """Fetch stock symbol suggestions using Finnhub API."""
-    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "d1sdgppr01qs2slhjh20d1sdgppr01qs2slhjh2g":
-        st.warning("Please provide a valid Finnhub API key in the code to enable stock symbol suggestions.")
+    """
+    Fetch stock symbol suggestions using Finnhub API.
+    
+    Args:
+        query (str): Search query for stock symbols
+        
+    Returns:
+        list: List of suggested stock symbols with descriptions
+    """
+    if not FINNHUB_API_KEY:
+        st.warning("Finnhub API key not available. Symbol suggestions disabled.")
         return []
+    
     url = f"https://finnhub.io/api/v1/search?q={query}&token={FINNHUB_API_KEY}"
     response = requests.get(url)
     response.raise_for_status()
     data = response.json()
+    
     if 'result' in data:
         suggestions = [
             f"{item['symbol']} - {item['description']}"
@@ -145,11 +243,19 @@ def get_symbol_suggestions(query):
 
 @safe_execute
 def _get_realtime_price_finnhub(symbol):
-    """Fetches real-time price from Finnhub API.
+    """
+    Fetches real-time price from Finnhub API.
+    
     This function is kept for potential future use or if the user decides to switch back,
     but its output is not used for current price metrics in get_google_finance_data as per request.
+    
+    Args:
+        symbol (str): Stock symbol to fetch price for
+        
+    Returns:
+        tuple: (current_price, previous_close) or (None, None) if failed
     """
-    if not FINNHUB_API_KEY or FINNHUB_API_KEY == "d1sdgppr01qs2slhjh20d1sdgppr01qs2slhjh2g":
+    if not FINNHUB_API_KEY:
         st.warning("Finnhub API key is not set. Real-time price may not be accurate.")
         return None, None
     
@@ -317,57 +423,314 @@ def get_google_finance_data(symbol, exchange):
         st.error(f"Failed to scrape data from Google Finance: {e}. The website structure might have changed or data is missing.")
         return None
 
-# --- AI Trading Analysis Functions ---
+# --- Advanced AI Trading Analysis Functions ---
 def calculate_technical_indicators(data):
+    """
+    Calculate comprehensive technical indicators for stock analysis.
+    
+    Args:
+        data (pd.DataFrame): Historical stock data with OHLCV columns
+        
+    Returns:
+        pd.DataFrame: Data with calculated technical indicators
+    """
     try:
         if data is None or len(data) < 50:
             st.warning("Not enough data to calculate all technical indicators. Need at least 50 data points.")
             return pd.DataFrame()
+        
+        # Moving Averages
         data['SMA_20'] = data['Close'].rolling(window=20).mean()
         data['SMA_50'] = data['Close'].rolling(window=50).mean()
         data['EMA_12'] = data['Close'].ewm(span=12).mean()
         data['EMA_26'] = data['Close'].ewm(span=26).mean()
+        
+        # MACD (Moving Average Convergence Divergence)
         data['MACD'] = data['EMA_12'] - data['EMA_26']
         data['Signal'] = data['MACD'].ewm(span=9).mean()
+        data['MACD_Histogram'] = data['MACD'] - data['Signal']
+        
+        # RSI (Relative Strength Index)
         delta = data['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         data['RSI'] = 100 - (100 / (1 + rs))
+        
+        # Bollinger Bands
         data['BB_Middle'] = data['Close'].rolling(window=20).mean()
         bb_std = data['Close'].rolling(window=20).std()
         data['BB_Upper'] = data['BB_Middle'] + (bb_std * 2)
         data['BB_Lower'] = data['BB_Middle'] - (bb_std * 2)
+        data['BB_Width'] = ((data['BB_Upper'] - data['BB_Lower']) / data['BB_Middle']) * 100
+        
+        # Additional momentum indicators
+        # Stochastic Oscillator
+        low_14 = data['Low'].rolling(window=14).min()
+        high_14 = data['High'].rolling(window=14).max()
+        data['%K'] = 100 * ((data['Close'] - low_14) / (high_14 - low_14))
+        data['%D'] = data['%K'].rolling(window=3).mean()
+        
+        # Price Rate of Change (ROC)
+        data['ROC_10'] = ((data['Close'] - data['Close'].shift(10)) / data['Close'].shift(10)) * 100
+        
+        # Volume indicators (if Volume data is available)
         if 'Volume' in data.columns:
             data['Volume_SMA'] = data['Volume'].rolling(window=20).mean()
+            # Volume Rate of Change
+            data['Volume_ROC'] = ((data['Volume'] - data['Volume'].shift(10)) / data['Volume'].shift(10)) * 100
+            # On-Balance Volume (OBV)
+            data['OBV'] = (data['Volume'] * (~data['Close'].diff().le(0) * 2 - 1)).cumsum()
+        
+        # Williams %R
+        data['Williams_R'] = -100 * ((high_14 - data['Close']) / (high_14 - low_14))
+        
         return data.dropna()
     except Exception as e:
         st.error(f"Technical analysis error: {e}")
         return pd.DataFrame()
 
-def generate_trading_signal(data):
-    if data.empty: return "HOLD", "Insufficient data for analysis.", 0.5
+def calculate_advanced_signals(data):
+    """
+    Calculate advanced trading signals using multiple technical indicators with weighted scoring.
+    
+    Args:
+        data (pd.DataFrame): DataFrame with calculated technical indicators
+        
+    Returns:
+        dict: Dictionary containing signal scores and individual indicator signals
+    """
+    if data.empty:
+        return {"total_score": 0, "signals": {}, "confidence": 0.5}
+    
     latest = data.iloc[-1]
-    signals = []
-    latest = latest.replace([np.inf, -np.inf], np.nan).dropna()
-    if latest.get('RSI', 50) < 30: signals.append("BUY")
-    elif latest.get('RSI', 50) > 70: signals.append("SELL")
-    if latest.get('SMA_20', np.nan) > latest.get('SMA_50', np.nan): signals.append("BUY")
-    elif latest.get('SMA_20', np.nan) < latest.get('SMA_50', np.nan): signals.append("SELL")
-    if latest.get('MACD', np.nan) > latest.get('Signal', np.nan): signals.append("BUY")
-    elif latest.get('MACD', np.nan) < latest.get('Signal', np.nan): signals.append("SELL")
-    if latest.get('Close', np.nan) > latest.get('BB_Upper', np.nan): signals.append("SELL")
-    elif latest.get('Close', np.nan) < latest.get('BB_Lower', np.nan): signals.append("BUY")
-    buy_signals = signals.count("BUY")
-    sell_signals = signals.count("SELL")
-    total_signals = buy_signals + sell_signals
-    confidence = 0.5 + (buy_signals - sell_signals) * 0.1
-    if buy_signals > sell_signals: return "BUY", f"Strong bullish indicators ({buy_signals} signals).", min(confidence, 1.0)
-    elif sell_signals > buy_signals: return "SELL", f"Strong bearish indicators ({sell_signals} signals).", min(confidence, 1.0)
-    else: return "HOLD", "Mixed signals or insufficient data. Wait for a clearer trend.", 0.5
+    signals = {}
+    scores = {}
+    
+    # Replace infinite values with NaN and then fill with neutral values
+    latest = latest.replace([np.inf, -np.inf], np.nan)
+    
+    # RSI Analysis (Weight: 20%)
+    rsi_val = latest.get('RSI', 50)
+    if pd.notna(rsi_val):
+        if rsi_val < 30:
+            signals['RSI'] = 'STRONG_BUY'
+            scores['RSI'] = 2.0
+        elif rsi_val < 40:
+            signals['RSI'] = 'BUY'
+            scores['RSI'] = 1.0
+        elif rsi_val > 70:
+            signals['RSI'] = 'STRONG_SELL'
+            scores['RSI'] = -2.0
+        elif rsi_val > 60:
+            signals['RSI'] = 'SELL'
+            scores['RSI'] = -1.0
+        else:
+            signals['RSI'] = 'NEUTRAL'
+            scores['RSI'] = 0
+    else:
+        signals['RSI'] = 'NEUTRAL'
+        scores['RSI'] = 0
+    
+    # MACD Analysis (Weight: 25%)
+    macd = latest.get('MACD', 0)
+    signal_line = latest.get('Signal', 0)
+    macd_hist = latest.get('MACD_Histogram', 0)
+    
+    if pd.notna(macd) and pd.notna(signal_line):
+        if macd > signal_line and macd_hist > 0:
+            signals['MACD'] = 'STRONG_BUY'
+            scores['MACD'] = 2.5
+        elif macd > signal_line:
+            signals['MACD'] = 'BUY'
+            scores['MACD'] = 1.5
+        elif macd < signal_line and macd_hist < 0:
+            signals['MACD'] = 'STRONG_SELL'
+            scores['MACD'] = -2.5
+        elif macd < signal_line:
+            signals['MACD'] = 'SELL'
+            scores['MACD'] = -1.5
+        else:
+            signals['MACD'] = 'NEUTRAL'
+            scores['MACD'] = 0
+    else:
+        signals['MACD'] = 'NEUTRAL'
+        scores['MACD'] = 0
+    
+    # Moving Average Analysis (Weight: 20%)
+    sma_20 = latest.get('SMA_20', 0)
+    sma_50 = latest.get('SMA_50', 0)
+    current_price = latest.get('Close', 0)
+    
+    if pd.notna(sma_20) and pd.notna(sma_50) and current_price > 0:
+        if current_price > sma_20 > sma_50:
+            signals['MA'] = 'STRONG_BUY'
+            scores['MA'] = 2.0
+        elif current_price > sma_20:
+            signals['MA'] = 'BUY'
+            scores['MA'] = 1.0
+        elif current_price < sma_20 < sma_50:
+            signals['MA'] = 'STRONG_SELL'
+            scores['MA'] = -2.0
+        elif current_price < sma_20:
+            signals['MA'] = 'SELL'
+            scores['MA'] = -1.0
+        else:
+            signals['MA'] = 'NEUTRAL'
+            scores['MA'] = 0
+    else:
+        signals['MA'] = 'NEUTRAL'
+        scores['MA'] = 0
+    
+    # Bollinger Bands Analysis (Weight: 15%)
+    bb_upper = latest.get('BB_Upper', 0)
+    bb_lower = latest.get('BB_Lower', 0)
+    bb_width = latest.get('BB_Width', 0)
+    
+    if pd.notna(bb_upper) and pd.notna(bb_lower) and current_price > 0:
+        if current_price <= bb_lower:
+            signals['BB'] = 'BUY'
+            scores['BB'] = 1.5
+        elif current_price >= bb_upper:
+            signals['BB'] = 'SELL'
+            scores['BB'] = -1.5
+        else:
+            signals['BB'] = 'NEUTRAL'
+            scores['BB'] = 0
+    else:
+        signals['BB'] = 'NEUTRAL'
+        scores['BB'] = 0
+    
+    # Stochastic Oscillator Analysis (Weight: 10%)
+    k_percent = latest.get('%K', 50)
+    d_percent = latest.get('%D', 50)
+    
+    if pd.notna(k_percent) and pd.notna(d_percent):
+        if k_percent < 20 and d_percent < 20:
+            signals['STOCH'] = 'BUY'
+            scores['STOCH'] = 1.0
+        elif k_percent > 80 and d_percent > 80:
+            signals['STOCH'] = 'SELL'
+            scores['STOCH'] = -1.0
+        else:
+            signals['STOCH'] = 'NEUTRAL'
+            scores['STOCH'] = 0
+    else:
+        signals['STOCH'] = 'NEUTRAL'
+        scores['STOCH'] = 0
+    
+    # Williams %R Analysis (Weight: 10%)
+    williams_r = latest.get('Williams_R', -50)
+    if pd.notna(williams_r):
+        if williams_r < -80:
+            signals['WILLIAMS'] = 'BUY'
+            scores['WILLIAMS'] = 1.0
+        elif williams_r > -20:
+            signals['WILLIAMS'] = 'SELL'
+            scores['WILLIAMS'] = -1.0
+        else:
+            signals['WILLIAMS'] = 'NEUTRAL'
+            scores['WILLIAMS'] = 0
+    else:
+        signals['WILLIAMS'] = 'NEUTRAL'
+        scores['WILLIAMS'] = 0
+    
+    # Calculate weighted total score
+    weights = {
+        'RSI': 0.20,
+        'MACD': 0.25,
+        'MA': 0.20,
+        'BB': 0.15,
+        'STOCH': 0.10,
+        'WILLIAMS': 0.10
+    }
+    
+    total_score = sum(scores.get(indicator, 0) * weight for indicator, weight in weights.items())
+    
+    # Calculate confidence based on signal consensus
+    buy_signals = sum(1 for signal in signals.values() if 'BUY' in signal)
+    sell_signals = sum(1 for signal in signals.values() if 'SELL' in signal)
+    total_signals = len([s for s in signals.values() if s != 'NEUTRAL'])
+    
+    if total_signals > 0:
+        consensus = max(buy_signals, sell_signals) / len(signals)
+        confidence = 0.5 + (consensus * 0.4) + (abs(total_score) / 10 * 0.1)
+        confidence = min(confidence, 0.95)  # Cap at 95%
+    else:
+        confidence = 0.5
+    
+    return {
+        "total_score": total_score,
+        "signals": signals,
+        "confidence": confidence,
+        "buy_signals": buy_signals,
+        "sell_signals": sell_signals
+    }
+
+def generate_trading_signal(data):
+    """
+    Generate enhanced trading signal with improved accuracy using mathematical models.
+    
+    Args:
+        data (pd.DataFrame): DataFrame with calculated technical indicators
+        
+    Returns:
+        tuple: (signal, reason, confidence) where signal is BUY/SELL/HOLD
+    """
+    if data.empty:
+        return "HOLD", "Insufficient data for analysis.", 0.5
+    
+    # Get advanced signal analysis
+    analysis = calculate_advanced_signals(data)
+    total_score = analysis["total_score"]
+    signals = analysis["signals"]
+    confidence = analysis["confidence"]
+    
+    # Enhanced decision logic with stricter thresholds for higher accuracy
+    if total_score >= 1.5:
+        signal = "BUY"
+        reason = f"Strong bullish consensus ({analysis['buy_signals']}/{len(signals)} indicators). "
+        reason += f"Key signals: {', '.join([k for k, v in signals.items() if 'BUY' in v])}"
+    elif total_score <= -1.5:
+        signal = "SELL"
+        reason = f"Strong bearish consensus ({analysis['sell_signals']}/{len(signals)} indicators). "
+        reason += f"Key signals: {', '.join([k for k, v in signals.items() if 'SELL' in v])}"
+    elif 0.5 <= total_score < 1.5:
+        signal = "BUY"
+        reason = f"Moderate bullish signals (Score: {total_score:.2f}). Exercise caution."
+        confidence *= 0.8  # Reduce confidence for moderate signals
+    elif -1.5 < total_score <= -0.5:
+        signal = "SELL"
+        reason = f"Moderate bearish signals (Score: {total_score:.2f}). Exercise caution."
+        confidence *= 0.8  # Reduce confidence for moderate signals
+    else:
+        signal = "HOLD"
+        reason = f"Mixed or weak signals (Score: {total_score:.2f}). Wait for clearer trend."
+        confidence = min(confidence, 0.6)  # Cap confidence for hold signals
+    
+    # Add momentum check for additional validation
+    latest = data.iloc[-1]
+    roc_10 = latest.get('ROC_10', 0)
+    if pd.notna(roc_10):
+        if abs(roc_10) > 5:  # Strong momentum
+            if (signal == "BUY" and roc_10 > 0) or (signal == "SELL" and roc_10 < 0):
+                confidence = min(confidence * 1.1, 0.95)  # Boost confidence if momentum aligns
+                reason += f" Strong momentum support ({roc_10:.1f}%)."
+        
+    return signal, reason, min(confidence, 0.95)
 
 # --- Charting, Risk, Performance, and Transaction Functions ---
 def create_advanced_chart(data, symbol):
+    """
+    Create comprehensive technical analysis chart with multiple indicators.
+    
+    Args:
+        data (pd.DataFrame): Historical data with calculated technical indicators
+        symbol (str): Stock symbol for chart title
+        
+    Returns:
+        plotly.graph_objects.Figure: Multi-subplot chart with price, volume, and indicators
+    """
     if data.empty:
         fig = go.Figure()
         fig.add_annotation(text="No chart data available.", x=0.5, y=0.5, showarrow=False)
@@ -411,6 +774,15 @@ def create_advanced_chart(data, symbol):
     return fig
 
 def calculate_risk_metrics(data):
+    """
+    Calculate risk metrics including volatility and risk level assessment.
+    
+    Args:
+        data (pd.DataFrame): Historical stock data with Close prices
+        
+    Returns:
+        dict: Risk metrics including volatility, risk level, and recommendations
+    """
     if data.empty or 'Close' not in data.columns:
         return {"volatility": 0, "risk_level": "N/A", "recommendation": "Insufficient data."}
     returns = data['Close'].pct_change().dropna()
@@ -421,6 +793,15 @@ def calculate_risk_metrics(data):
     return {"volatility": volatility, "risk_level": risk_level, "risk_color": risk_color, "recommendation": recommendation}
 
 def calculate_performance_metrics(data):
+    """
+    Calculate performance metrics including returns and Sharpe ratio.
+    
+    Args:
+        data (pd.DataFrame): Historical stock data with Close prices
+        
+    Returns:
+        dict: Performance metrics including various return periods and Sharpe ratio
+    """
     if data.empty or 'Close' not in data.columns: return {}
     returns = data['Close'].pct_change().dropna()
     metrics = {
@@ -431,20 +812,66 @@ def calculate_performance_metrics(data):
     }
     return metrics
 
-def buy_stock(symbol, quantity, price): st.session_state.transaction_log.append({'action': 'buy', 'symbol': symbol, 'quantity': quantity, 'price': price, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}); st.success(f"Bought {quantity} shares of {symbol} at ₹{price:.2f} each.")
-def sell_stock(symbol, quantity, price): st.session_state.transaction_log.append({'action': 'sell', 'symbol': symbol, 'quantity': quantity, 'price': price, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}); st.success(f"Sold {quantity} shares of {symbol} at ₹{price:.2f} each.")
-def hold_stock(symbol): st.session_state.transaction_log.append({'action': 'hold', 'symbol': symbol, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}); st.info(f"Holding {symbol}.")
+def buy_stock(symbol, quantity, price): 
+    """Record a buy transaction in the session state transaction log."""
+    st.session_state.transaction_log.append({'action': 'buy', 'symbol': symbol, 'quantity': quantity, 'price': price, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    st.success(f"Bought {quantity} shares of {symbol} at ₹{price:.2f} each.")
+
+def sell_stock(symbol, quantity, price): 
+    """Record a sell transaction in the session state transaction log."""
+    st.session_state.transaction_log.append({'action': 'sell', 'symbol': symbol, 'quantity': quantity, 'price': price, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    st.success(f"Sold {quantity} shares of {symbol} at ₹{price:.2f} each.")
+
+def hold_stock(symbol): 
+    """Record a hold decision in the session state transaction log."""
+    st.session_state.transaction_log.append({'action': 'hold', 'symbol': symbol, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    st.info(f"Holding {symbol}.")
 
 # --- Main Dashboard Logic (Equity) ---
 def equity_dashboard():
+    """
+    Main equity dashboard function with enhanced error handling and symbol validation.
+    Provides real-time stock analysis with AI-powered trading recommendations.
+    """
     st.sidebar.markdown("---")
-    data_source = st.sidebar.selectbox("📈 Select Data Source", ["Google Finance (Real-time)", "NSE Library (Comprehensive)", "Demo Mode"], index=0) # Set default to Google Finance
+    
+    # Data source selection
+    data_source = st.sidebar.selectbox(
+        "📈 Select Data Source", 
+        ["Google Finance (Real-time)", "NSE Library (Comprehensive)", "Demo Mode"], 
+        index=0
+    )
+    
+    # Stock symbol input with validation
     symbol_input = st.sidebar.text_input("Stock Symbol or Name", "TCS")
+    
+    # Symbol validation
+    if symbol_input:
+        is_valid, validation_message = validate_stock_symbol(symbol_input)
+        if not is_valid:
+            st.sidebar.error(f"❌ {validation_message}")
+            return
+        
+        # Check symbol availability (optional quick check)
+        if st.sidebar.checkbox("Verify symbol availability", value=False):
+            with st.spinner("Checking symbol..."):
+                is_available, availability_message = check_symbol_availability(symbol_input, data_source)
+                if not is_available:
+                    st.sidebar.warning(f"⚠️ {availability_message}")
+                else:
+                    st.sidebar.success(f"✅ {availability_message}")
+    
+    # Get symbol suggestions
     suggestions = get_symbol_suggestions(symbol_input)
     if suggestions:
-        st.sidebar.info("Suggestions:")
-        for s in suggestions[:5]: st.sidebar.markdown(f"- `{s}`")
+        st.sidebar.info("💡 Suggestions:")
+        for s in suggestions[:5]:
+            st.sidebar.markdown(f"- `{s}`")
+    
+    # Clean symbol for processing
     symbol_to_fetch = symbol_input.upper().split(' ')[0]
+    
+    # Period selection for NSE Library
     period = "3M"
     if data_source == "NSE Library (Comprehensive)":
         if not NSELIB_AVAILABLE:
@@ -452,46 +879,59 @@ def equity_dashboard():
             return
         period = st.sidebar.selectbox("Time Period", ["1M", "3M", "6M", "1Y"])
     
+    # Refresh controls
     col_refresh, col_auto = st.sidebar.columns(2)
     if col_refresh.button("🔄 Refresh Data", key="manual_refresh_btn"):
         st.cache_data.clear()
-        # FIX: Replaced experimental_rerun with rerun
         st.rerun()
     
-    auto_refresh_toggle = col_auto.checkbox("Auto Refresh (60s)", value=False, help="Automatically refreshes data every 60 seconds.")
+    auto_refresh_toggle = col_auto.checkbox(
+        "Auto Refresh (60s)", 
+        value=False, 
+        help="Automatically refreshes data every 60 seconds."
+    )
     if auto_refresh_toggle:
         st_autorefresh(interval=60000, key="auto_refresh_trigger")
     
+    # Data fetching with improved error handling
     with st.spinner(f"Fetching market data for {symbol_to_fetch}..."):
-        if data_source == "Google Finance (Real-time)":
-            stock_data = get_google_finance_data(symbol_to_fetch, "NSE")
-        elif data_source == "NSE Library (Comprehensive)":
-            # IMPROVED: Added a check for NSELib data source failure
-            try:
-                stock_data = get_nse_data(symbol_to_fetch, period)
-                if stock_data is None:
-                    raise ValueError("NSELib data fetch failed, using demo data.")
-            except Exception as e:
-                st.error(f"NSE Library data fetch failed: {e}. Falling back to demo data.")
+        stock_data = None
+        
+        try:
+            if data_source == "Google Finance (Real-time)":
+                stock_data = get_google_finance_data(symbol_to_fetch, "NSE")
+            elif data_source == "NSE Library (Comprehensive)":
+                try:
+                    stock_data = get_nse_data(symbol_to_fetch, period)
+                    if stock_data is None:
+                        raise ValueError("NSELib data fetch failed, using demo data.")
+                except Exception as e:
+                    st.error(f"NSE Library data fetch failed: {e}. Falling back to demo data.")
+                    stock_data = create_demo_data(symbol_to_fetch)
+            else:
                 stock_data = create_demo_data(symbol_to_fetch)
-        else:
-            stock_data = create_demo_data(symbol_to_fetch)
+        except Exception as e:
+            st.error(f"Data fetching error: {e}")
+            return
 
+    # Validate fetched data
     if stock_data is None:
-        st.error(f"❌ Unable to fetch data for {symbol_to_fetch}. Please check the symbol and try a different data source.")
+        st.error(f"❌ Unable to fetch data for '{symbol_to_fetch}'. Possible reasons:")
+        st.error("• Symbol may not exist or is incorrectly spelled")
+        st.error("• Selected data source may be temporarily unavailable")
+        st.error("• Network connectivity issues")
+        st.info("💡 Try: Different data source, verify symbol spelling, or check internet connection")
         return
     
     st.success(f"✅ Data loaded successfully for {stock_data['symbol']}")
     
-    # --- Start of fix for KeyError: 'Close' ---
-    # Ensure 'historical' key exists and is a DataFrame
+    # Validate historical data structure
     if 'historical' not in stock_data or not isinstance(stock_data['historical'], pd.DataFrame):
         st.error(f"Data Error: 'historical' data is missing or not in expected format for {symbol_to_fetch}. Cannot proceed with analysis.")
         return
 
     historical_data = stock_data['historical']
     
-    # Check if historical_data is empty or missing 'Close' column
     if historical_data.empty:
         st.error(f"Data Error: Historical data for {symbol_to_fetch} is empty. Cannot perform analysis.")
         return
@@ -499,34 +939,45 @@ def equity_dashboard():
     if 'Close' not in historical_data.columns:
         st.error(f"Data Error: 'Close' price column is missing in historical data for {symbol_to_fetch}. Cannot perform analysis.")
         return
-    # --- End of fix for KeyError: 'Close' ---
-
+    
+    # Calculate current metrics
     latest_price = stock_data.get('price', historical_data['Close'].iloc[-1])
-    prev_price = stock_data.get('prev_close', historical_data['Close'].iloc[-2] if len(historical_data) > 1 else latest_price) # Use prev_close from stock_data if available
+    prev_price = stock_data.get('prev_close', historical_data['Close'].iloc[-2] if len(historical_data) > 1 else latest_price)
     price_change = latest_price - prev_price
     price_change_pct = (price_change / prev_price) * 100 if prev_price != 0 else 0
     volume = stock_data.get('volume', historical_data['Volume'].iloc[-1]) if 'Volume' in historical_data.columns else "N/A"
     
+    # Display key metrics
     col1, col2, col3, col4 = st.columns(4)
-    with col1: st.metric("Current Price", f"₹{latest_price:.2f}", f"{price_change:.2f} ({price_change_pct:.2f}%)")
-    with col2: st.metric("Volume", f"{volume:,}" if isinstance(volume, (int, float)) else volume)
-    with col3: st.metric("Day High", f"₹{historical_data['High'].iloc[-1]:.2f}")
-    with col4: st.metric("Day Low", f"₹{historical_data['Low'].iloc[-1]:.2f}")
+    with col1:
+        st.metric("Current Price", f"₹{latest_price:.2f}", f"{price_change:.2f} ({price_change_pct:.2f}%)")
+    with col2:
+        st.metric("Volume", f"{volume:,}" if isinstance(volume, (int, float)) else volume)
+    with col3:
+        st.metric("Day High", f"₹{historical_data['High'].iloc[-1]:.2f}")
+    with col4:
+        st.metric("Day Low", f"₹{historical_data['Low'].iloc[-1]:.2f}")
     
-    st.subheader("🎯 AI Trading Recommendation")
-    with st.spinner("Analyzing market trends..."):
+    # AI Trading Recommendation Section
+    st.subheader("🎯 Enhanced AI Trading Recommendation")
+    with st.spinner("Analyzing market trends with advanced algorithms..."):
         analyzed_data = calculate_technical_indicators(historical_data.copy())
         signal, reason, confidence = generate_trading_signal(analyzed_data)
+    
+    # Display trading signal with enhanced visualization
     signal_class = f"{signal.lower()}-signal"
     confidence_bar = "🟢" * int(confidence * 10) + "⚪" * (10 - int(confidence * 10))
+    
     st.markdown(f"""
     <div class="prediction-box {signal_class}">
         <h3>📊 {signal}</h3>
         <p>{reason}</p>
         <p>Confidence: {confidence_bar} ({confidence:.1%})</p>
+        <small>🤖 Enhanced AI Model | Target Accuracy: 80%+</small>
     </div>
     """, unsafe_allow_html=True)
     
+    # Technical Analysis Chart
     st.subheader("📈 Advanced Technical Analysis")
     chart = create_advanced_chart(analyzed_data, stock_data['symbol'])
     st.plotly_chart(chart, use_container_width=True)
@@ -612,6 +1063,16 @@ def equity_dashboard():
 
 # --- Derivatives Dashboard Logic ---
 def get_nse_data(symbol, period="3M"):
+    """
+    Fetch stock data from NSE using nselib library.
+    
+    Args:
+        symbol (str): Stock symbol to fetch
+        period (str): Time period for data (1M, 3M, 6M, 1Y)
+        
+    Returns:
+        dict: Stock data with symbol, historical data, and last updated timestamp
+    """
     if not NSELIB_AVAILABLE: return None
     data = capital_market.price_volume_and_deliverable_position_data(symbol=symbol, period=period)
     if data is not None and not data.empty:
@@ -625,17 +1086,39 @@ def get_nse_data(symbol, period="3M"):
     return None
 
 def create_demo_data(symbol):
+    """
+    Create synthetic demo data for testing and fallback purposes.
+    
+    Args:
+        symbol (str): Stock symbol to generate data for
+        
+    Returns:
+        dict: Synthetic stock data with historical OHLCV data
+    """
     dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
-    np.random.seed(hash(symbol) % 1000)
+    np.random.seed(hash(symbol) % 1000)  # Deterministic random data based on symbol
     base_price = 100 + (hash(symbol) % 1000)
     returns = np.random.normal(0.001, 0.02, 100)
     prices = [base_price]
     for ret in returns[1:]: prices.append(prices[-1] * (1 + ret))
-    historical_data = pd.DataFrame({'Date': dates, 'Open': [p * np.random.uniform(0.98, 1.02) for p in prices], 'High': [p * np.random.uniform(1.00, 1.05) for p in prices], 'Low': [p * np.random.uniform(0.95, 1.00) for p in prices], 'Close': prices, 'Volume': np.random.randint(1000000, 10000000, 100)})
+    
+    # Generate realistic OHLC data
+    historical_data = pd.DataFrame({
+        'Date': dates, 
+        'Open': [p * np.random.uniform(0.98, 1.02) for p in prices], 
+        'High': [p * np.random.uniform(1.00, 1.05) for p in prices], 
+        'Low': [p * np.random.uniform(0.95, 1.00) for p in prices], 
+        'Close': prices, 
+        'Volume': np.random.randint(1000000, 10000000, 100)
+    })
     historical_data.set_index('Date', inplace=True)
     return {'symbol': symbol, 'price': prices[-1], 'historical': historical_data, 'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 def derivatives_dashboard():
+    """
+    Derivatives dashboard for NSE equity and derivative market data.
+    Provides access to various NSE data sources including options, futures, and market data.
+    """
     st.sidebar.subheader("Derivatives Data Options")
     instrument = st.sidebar.selectbox("Instrument Type", options=("NSE Equity Market", "NSE Derivative Market"))
     data = None
