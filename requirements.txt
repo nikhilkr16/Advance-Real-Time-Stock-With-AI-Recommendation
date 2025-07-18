@@ -10,3 +10,4 @@ pytz
 numpy
 plotly
 yfinance
+streamlit_autorefresh
