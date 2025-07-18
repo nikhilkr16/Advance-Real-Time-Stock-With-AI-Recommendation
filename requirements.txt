@@ -1,6 +1,6 @@
+nselib
 streamlit
 pandas
-nselib
 beautifulsoup4
 lxml
 html5lib
