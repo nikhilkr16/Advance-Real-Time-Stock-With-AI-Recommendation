@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 import warnings
 import json
 from streamlit_autorefresh import st_autorefresh
+from nselib import capital_market
+from nselib import derivatives
+import pandas_market_calendars as mcal
 
 warnings.filterwarnings('ignore')
 
